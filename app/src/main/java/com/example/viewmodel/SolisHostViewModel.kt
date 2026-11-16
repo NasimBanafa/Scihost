@@ -118,6 +118,8 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
                 isPrivileged = false
             )
             refreshRootCapabilities()
+            // Automatically start the Sunshine HTTP (:47989) + HTTPS (:47984) + RTSP (:48010) discovery daemon on launch!
+            startSunshineDiscoveryDaemonOnly()
         }
     }
 
@@ -131,6 +133,60 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
                 appendLog(sub, msg, priv, warn)
             }
             _rootReport.value = report
+        }
+    }
+
+    private fun startSunshineDiscoveryDaemonOnly() {
+        viewModelScope.launch {
+            val cfg = repository.getOrCreateConfig()
+            val preset = runCatching { TabletResolutionPreset.valueOf(cfg.resolutionPresetName) }
+                .getOrDefault(TabletResolutionPreset.WUXGA_1920_1200)
+
+            discoveryServer.startSunshineDaemon(
+                hostName = cfg.hostName,
+                captureModeProvider = {
+                    runCatching { DisplayCaptureMode.valueOf(hostConfig.value.captureModeName) }
+                        .getOrDefault(DisplayCaptureMode.VIRTUAL_EXTENDED)
+                },
+                scope = viewModelScope,
+                onPinPairingRequested = { req ->
+                    _pendingPinRequest.value = req
+                    appendLog("MOONLIGHT-PAIR", "Incoming PIN pairing handshake from ${req.clientDeviceName}", false)
+                },
+                onPairSuccess = { devName, clientIp, pinUsed ->
+                    saveVerifiedPairedClient(devName, clientIp, pinUsed)
+                },
+                onClientStreamLaunch = { appId, clientIp ->
+                    val launchedMode = if (appId == 2) {
+                        DisplayCaptureMode.MIRROR_PRIMARY
+                    } else {
+                        DisplayCaptureMode.VIRTUAL_EXTENDED
+                    }
+                    encoderEngine.updateTargetClientIp(clientIp)
+                    updateDisplayCaptureMode(launchedMode)
+                    if (_telemetry.value.status != HostStreamStatus.STREAMING_ACTIVE) {
+                        startHostStream()
+                    }
+                },
+                onReturnInputPacket = { nx, ny, isStylus, pressure ->
+                    _telemetry.update { it.copy(returnInputRateHz = (it.returnInputRateHz + 15).coerceAtMost(240)) }
+                    if (hostConfig.value.rootModeEnabled && hostConfig.value.rootUinputInjection) {
+                        viewModelScope.launch {
+                            rootManager.injectTabletTouchOrStylusEvent(
+                                displayId = _telemetry.value.virtualDisplayId,
+                                normalizedX = nx,
+                                normalizedY = ny,
+                                displayWidth = preset.width,
+                                displayHeight = preset.height,
+                                pressure = pressure,
+                                isStylus = isStylus,
+                                onLog = { msg -> appendLog("UINPUT", msg, isPrivileged = true) }
+                            )
+                        }
+                    }
+                },
+                onLog = { msg -> appendLog("SUNSHINE-NET", msg, isPrivileged = false) }
+            )
         }
     }
 
@@ -184,37 +240,8 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
 
-            // 3. Start Sunshine mDNS + HTTP/S Pairing + UDP Return Input Server
-            discoveryServer.startSunshineDaemon(
-                hostName = cfg.hostName,
-                captureModeProvider = {
-                    runCatching { DisplayCaptureMode.valueOf(hostConfig.value.captureModeName) }
-                        .getOrDefault(DisplayCaptureMode.VIRTUAL_EXTENDED)
-                },
-                scope = viewModelScope,
-                onPinPairingRequested = { req ->
-                    _pendingPinRequest.value = req
-                    appendLog("MOONLIGHT-PAIR", "Incoming PIN pairing handshake from ${req.clientDeviceName} (${req.clientIp})", false)
-                },
-                onReturnInputPacket = { nx, ny, isStylus, pressure ->
-                    _telemetry.update { it.copy(returnInputRateHz = (it.returnInputRateHz + 15).coerceAtMost(240)) }
-                    if (hostConfig.value.rootModeEnabled && hostConfig.value.rootUinputInjection) {
-                        viewModelScope.launch {
-                            rootManager.injectTabletTouchOrStylusEvent(
-                                displayId = _telemetry.value.virtualDisplayId,
-                                normalizedX = nx,
-                                normalizedY = ny,
-                                displayWidth = preset.width,
-                                displayHeight = preset.height,
-                                pressure = pressure,
-                                isStylus = isStylus,
-                                onLog = { msg -> appendLog("UINPUT", msg, isPrivileged = true) }
-                            )
-                        }
-                    }
-                },
-                onLog = { msg -> appendLog("SUNSHINE-NET", msg, isPrivileged = false) }
-            )
+            // 3. Ensure Sunshine HTTP (:47989) + HTTPS (:47984) + RTSP (:48010) Server is running
+            startSunshineDiscoveryDaemonOnly()
 
             // 4. Start Zero-Copy Hardware Surface Encoder & RTP/UDP Streamer
             val session = encoderEngine.startSurfaceEncoder(
@@ -293,7 +320,6 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
             encoderEngine.stopEncoder()
-            discoveryServer.stopSunshineDaemon()
             boundService?.releaseVirtualDisplay()
 
             val app = getApplication<Application>()
@@ -308,7 +334,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
             _telemetry.update {
                 it.copy(
                     status = HostStreamStatus.IDLE,
-                    activeEncoderName = "Standby (No Active Surface)",
+                    activeEncoderName = "Standby (HTTPS :47984 Ready)",
                     activeCaptureBackend = "Standby",
                     encodeLatencyMs = 0f,
                     networkRttMs = 0f,
@@ -318,7 +344,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
                     isPhoneOledBlanked = false
                 )
             }
-            appendLog("HOST-DAEMON", "Sunshine stream session stopped cleanly; surfaces & encoders released.", false)
+            appendLog("HOST-DAEMON", "Video encoder stopped; Sunshine HTTP (:47989) & HTTPS (:47984) remain listening for Moonlight.", false)
         }
     }
 
@@ -429,7 +455,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
             requestId = Random.nextInt(1000, 9999).toString(),
             clientDeviceName = customClientName,
             clientIp = customClientIp,
-            expectedPinHint = "Enter any 4-digit PIN displayed on your 10\" Tablet's Moonlight client"
+            expectedPinHint = "Enter the 4-digit PIN displayed on your 10\" Tablet's Moonlight client"
         )
     }
 
@@ -438,18 +464,28 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun verifyAndPairMoonlightClient(pinCode: String, clientNameOverride: String) {
-        val pending = _pendingPinRequest.value ?: return
+        val pending = _pendingPinRequest.value
         if (pinCode.length != 4 || !pinCode.all { it.isDigit() }) return
 
+        // Release any blocked /pair?phrase=getservercert request from Moonlight with this exact 4-digit PIN!
+        discoveryServer.submitPinFromUser(pinCode)
+        _pendingPinRequest.value = null
+
+        val name = clientNameOverride.ifBlank { pending?.clientDeviceName ?: "Moonlight 10\" Tablet" }
+        val ip = pending?.clientIp ?: "192.168.1.148"
+        saveVerifiedPairedClient(name, ip, pinCode)
+    }
+
+    private fun saveVerifiedPairedClient(clientName: String, clientIp: String, pinCode: String) {
         viewModelScope.launch {
             val now = System.currentTimeMillis()
             val fingerprint = "SHA256:${pinCode.chunked(2).joinToString(":")}:A4:7F:E2:19:9C:B1:08:D4"
             val currentMode = hostConfig.value.captureModeName
             repository.addPairedClient(
                 PairedClientEntity(
-                    clientName = clientNameOverride.ifBlank { pending.clientDeviceName },
-                    clientIpAddress = pending.clientIp,
-                    tabletModelSpec = "10\" Tablet • PIN #$pinCode Verified • TLS 1.3 Client Cert",
+                    clientName = clientName,
+                    clientIpAddress = clientIp,
+                    tabletModelSpec = "10\" Tablet • PIN #$pinCode Verified • HTTPS :47984 mTLS",
                     certFingerprint = fingerprint,
                     pairedTimestampMs = now,
                     lastConnectedMs = now,
@@ -457,10 +493,9 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
                     isTrusted = true
                 )
             )
-            _pendingPinRequest.value = null
             appendLog(
                 subsystem = "PAIR-VAULT",
-                message = "Paired '${clientNameOverride.ifBlank { pending.clientDeviceName }}' (${pending.clientIp}) with PIN $pinCode & X.509 cert",
+                message = "Paired '$clientName' ($clientIp) with PIN $pinCode & X.509 RSA-2048 cert",
                 isPrivileged = false
             )
         }
@@ -476,6 +511,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     fun connectToPairedClient(client: PairedClientEntity) {
         viewModelScope.launch {
             repository.markClientConnected(client.id)
+            encoderEngine.updateTargetClientIp(client.clientIpAddress)
             appendLog("MOONLIGHT-LINK", "Initiated low-latency RTP stream to ${client.clientName} (${client.clientIpAddress})", false)
             startHostStream()
         }

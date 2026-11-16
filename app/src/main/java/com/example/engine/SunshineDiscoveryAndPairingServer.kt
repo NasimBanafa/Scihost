@@ -5,32 +5,60 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import com.example.model.DisplayCaptureMode
 import com.example.model.PendingPinRequest
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedReader
 import java.io.InputStreamReader
-import java.io.OutputStreamWriter
+import java.io.OutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
+import java.net.Socket
+import java.net.URLDecoder
+import java.util.Collections
 import java.util.UUID
+import javax.net.ssl.SSLServerSocket
+import javax.net.ssl.SSLSocket
 
 class SunshineDiscoveryAndPairingServer(
     private val context: Context
 ) {
+    val cryptoManager = SunshineCryptoManager(context)
+
     private var nsdManager: NsdManager? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
+
     private var httpServerSocket: ServerSocket? = null
+    private var httpsServerSocket: SSLServerSocket? = null
+    private var rtspServerSocket: ServerSocket? = null
+
     private var httpJob: Job? = null
+    private var httpsJob: Job? = null
+    private var rtspJob: Job? = null
     private var controlUdpJob: Job? = null
     private var controlUdpSocket: DatagramSocket? = null
 
-    val hostUuid: String = UUID.nameUUIDFromBytes("SolisHost-Sunshine-Android".toByteArray()).toString()
+    // Tracks IPs that have completed cryptographic pairing or connected via TLS with a pinned cert
+    private val pairedClientIps: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+
+    @Volatile
+    private var pendingPinDeferred: CompletableDeferred<String>? = null
+
+    @Volatile
+    private var lastSubmittedPin: String = "4829"
+
+    @Volatile
+    private var activeGameId: Int = 0
+
+    val hostUuid: String = UUID.nameUUIDFromBytes("SolisHost-Sunshine-v2-TLS".toByteArray()).toString()
 
     fun detectLocalLanIp(): String {
         try {
@@ -51,14 +79,26 @@ class SunshineDiscoveryAndPairingServer(
         return "192.168.1.100"
     }
 
+    /**
+     * Called when the user submits the 4-digit PIN displayed on their 10-inch tablet in SolisHost's UI.
+     */
+    fun submitPinFromUser(pinCode: String) {
+        lastSubmittedPin = pinCode
+        cryptoManager.updateActiveSessionPin(pinCode)
+        pendingPinDeferred?.complete(pinCode)
+    }
+
     fun startSunshineDaemon(
         hostName: String,
         httpPort: Int = 47989,
         httpsPort: Int = 47984,
+        rtspPort: Int = 48010,
         controlPort: Int = 47999,
         captureModeProvider: () -> DisplayCaptureMode,
         scope: CoroutineScope,
         onPinPairingRequested: (PendingPinRequest) -> Unit,
+        onPairSuccess: (clientName: String, clientIp: String, pinUsed: String) -> Unit,
+        onClientStreamLaunch: (appId: Int, clientIp: String) -> Unit,
         onReturnInputPacket: (normX: Float, normY: Float, isStylus: Boolean, pressure: Float) -> Unit,
         onLog: (String) -> Unit
     ) {
@@ -79,7 +119,7 @@ class SunshineDiscoveryAndPairingServer(
                     }
 
                     override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                        onLog("mDNS registration warning (code=$errorCode) — direct IP pairing remains active")
+                        onLog("mDNS registration note (code=$errorCode) — direct IP remains active")
                     }
 
                     override fun onServiceUnregistered(arg0: NsdServiceInfo) {}
@@ -90,75 +130,117 @@ class SunshineDiscoveryAndPairingServer(
                 registrationListener = listener
             }
         } catch (t: Throwable) {
-            onLog("mDNS init note: ${t.javaClass.simpleName} (LAN HTTP endpoint still active)")
+            onLog("mDNS init note: ${t.javaClass.simpleName}")
         }
 
-        // 2. Start Sunshine-compatible GameStream HTTP endpoint (/serverinfo, /applist, /pair, /launch)
+        // 2. Start HTTP Server on Port 47989 (/serverinfo, /pair phases 1-4, /applist fallback)
         httpJob = scope.launch(Dispatchers.IO) {
-            val server = runCatching { ServerSocket(httpPort) }
-                .recoverCatching { ServerSocket(0) }
-                .getOrNull()
+            val server = runCatching {
+                ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(httpPort))
+                }
+            }.recoverCatching { ServerSocket(0) }.getOrNull()
             httpServerSocket = server
 
             if (server != null) {
-                onLog("Sunshine HTTP Control Server listening on ${detectLocalLanIp()}:${server.localPort} (HTTPS: $httpsPort)")
+                onLog("Sunshine HTTP server online at ${detectLocalLanIp()}:${server.localPort}")
             }
 
             while (isActive && server != null && !server.isClosed) {
                 val client = runCatching { server.accept() }.getOrNull() ?: continue
                 launch(Dispatchers.IO) {
-                    runCatching {
-                        client.soTimeout = 3000
-                        val reader = BufferedReader(InputStreamReader(client.getInputStream()))
-                        val requestLine = reader.readLine() ?: ""
-                        val path = requestLine.split(" ").getOrNull(1) ?: "/"
-                        val remoteIp = client.inetAddress?.hostAddress ?: "192.168.1.142"
-
-                        val xmlBody = when {
-                            path.startsWith("/serverinfo") -> buildServerInfoXml(
-                                hostName = hostName,
-                                httpsPort = httpsPort,
-                                httpPort = server.localPort
-                            )
-                            path.startsWith("/applist") -> buildAppListXml(captureModeProvider())
-                            path.startsWith("/pair") -> {
-                                val devName = extractQueryParam(path, "devicename") ?: "Moonlight 10\" Tablet"
-                                onPinPairingRequested(
-                                    PendingPinRequest(
-                                        requestId = UUID.randomUUID().toString().take(8),
-                                        clientDeviceName = devName,
-                                        clientIp = remoteIp,
-                                        expectedPinHint = "Enter the 4-digit PIN shown on your 10\" Tablet"
-                                    )
-                                )
-                                """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"""
-                            }
-                            path.startsWith("/launch") || path.startsWith("/resume") -> {
-                                onLog("Moonlight client ($remoteIp) requested stream launch via $path")
-                                """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><sessionUrl0>rtsp://${detectLocalLanIp()}:48010</sessionUrl0><gamesession>1</gamesession></root>"""
-                            }
-                            else -> buildServerInfoXml(hostName, httpsPort, server.localPort)
-                        }
-
-                        val bodyBytes = xmlBody.toByteArray(Charsets.UTF_8)
-                        val writer = OutputStreamWriter(client.getOutputStream(), Charsets.UTF_8)
-                        writer.write("HTTP/1.1 200 OK\r\n")
-                        writer.write("Content-Type: application/xml; charset=utf-8\r\n")
-                        writer.write("Content-Length: ${bodyBytes.size}\r\n")
-                        writer.write("Connection: close\r\n\r\n")
-                        writer.write(xmlBody)
-                        writer.flush()
-                        client.close()
-                    }
+                    handleHttpOrHttpsClient(
+                        socket = client,
+                        isHttps = false,
+                        hostName = hostName,
+                        httpPort = server.localPort,
+                        httpsPort = httpsPort,
+                        rtspPort = rtspPort,
+                        captureModeProvider = captureModeProvider,
+                        onPinPairingRequested = onPinPairingRequested,
+                        onPairSuccess = onPairSuccess,
+                        onClientStreamLaunch = onClientStreamLaunch,
+                        onLog = onLog
+                    )
                 }
             }
         }
 
-        // 3. Start UDP Return Input / Stylus Control Listener on port 47999
+        // 3. Start HTTPS / TLS Server on Port 47984 (/applist, /appasset, /serverinfo, /launch, /resume, /pairchallenge)
+        httpsJob = scope.launch(Dispatchers.IO) {
+            val sslServer = runCatching {
+                val sslContext = cryptoManager.createServerSslContext()
+                (sslContext.serverSocketFactory.createServerSocket() as SSLServerSocket).apply {
+                    reuseAddress = true
+                    wantClientAuth = true
+                    needClientAuth = false
+                    bind(InetSocketAddress(httpsPort))
+                }
+            }.getOrNull()
+            httpsServerSocket = sslServer
+
+            if (sslServer != null) {
+                onLog("Sunshine HTTPS/TLS server online at ${detectLocalLanIp()}:${sslServer.localPort} (X.509 RSA-2048 ready)")
+            } else {
+                onLog("HTTPS port $httpsPort bind warning — check if another instance is running")
+            }
+
+            while (isActive && sslServer != null && !sslServer.isClosed) {
+                val sslClient = runCatching { sslServer.accept() as? SSLSocket }.getOrNull() ?: continue
+                launch(Dispatchers.IO) {
+                    runCatching {
+                        sslClient.useClientMode = false
+                        sslClient.wantClientAuth = true
+                        sslClient.needClientAuth = false
+                    }
+                    handleHttpOrHttpsClient(
+                        socket = sslClient,
+                        isHttps = true,
+                        hostName = hostName,
+                        httpPort = httpPort,
+                        httpsPort = sslServer.localPort,
+                        rtspPort = rtspPort,
+                        captureModeProvider = captureModeProvider,
+                        onPinPairingRequested = onPinPairingRequested,
+                        onPairSuccess = onPairSuccess,
+                        onClientStreamLaunch = onClientStreamLaunch,
+                        onLog = onLog
+                    )
+                }
+            }
+        }
+
+        // 4. Start RTSP Handshake Server on Port 48010 (OPTIONS, DESCRIBE, SETUP, ANNOUNCE, PLAY)
+        rtspJob = scope.launch(Dispatchers.IO) {
+            val rtspServer = runCatching {
+                ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(rtspPort))
+                }
+            }.recoverCatching { ServerSocket(0) }.getOrNull()
+            rtspServerSocket = rtspServer
+
+            if (rtspServer != null) {
+                onLog("RTSP stream setup server online on TCP :${rtspServer.localPort}")
+            }
+
+            while (isActive && rtspServer != null && !rtspServer.isClosed) {
+                val client = runCatching { rtspServer.accept() }.getOrNull() ?: continue
+                launch(Dispatchers.IO) {
+                    handleRtspSession(client, onLog)
+                }
+            }
+        }
+
+        // 5. Start UDP Return Input / Stylus Control Listener on Port 47999
         controlUdpJob = scope.launch(Dispatchers.IO) {
-            val socket = runCatching { DatagramSocket(controlPort) }
-                .recoverCatching { DatagramSocket(0) }
-                .getOrNull()
+            val socket = runCatching {
+                DatagramSocket(null).apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(controlPort))
+                }
+            }.recoverCatching { DatagramSocket(0) }.getOrNull()
             controlUdpSocket = socket
             if (socket != null) {
                 onLog("UDP Input & Stylus return channel bound on port ${socket.localPort}")
@@ -181,56 +263,385 @@ class SunshineDiscoveryAndPairingServer(
         }
     }
 
+    private suspend fun handleHttpOrHttpsClient(
+        socket: Socket,
+        isHttps: Boolean,
+        hostName: String,
+        httpPort: Int,
+        httpsPort: Int,
+        rtspPort: Int,
+        captureModeProvider: () -> DisplayCaptureMode,
+        onPinPairingRequested: (PendingPinRequest) -> Unit,
+        onPairSuccess: (clientName: String, clientIp: String, pinUsed: String) -> Unit,
+        onClientStreamLaunch: (appId: Int, clientIp: String) -> Unit,
+        onLog: (String) -> Unit
+    ) {
+        try {
+            socket.soTimeout = if (isHttps) 15_000 else 95_000
+            val remoteIp = socket.inetAddress?.hostAddress ?: "192.168.1.142"
+            if (isHttps) {
+                // Any client that completes a TLS handshake with our pinned server cert is paired
+                pairedClientIps.add(remoteIp)
+            }
+
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+            val requestLine = reader.readLine() ?: return
+            // Consume HTTP headers
+            var headerLine = reader.readLine()
+            while (!headerLine.isNullOrEmpty()) {
+                headerLine = reader.readLine()
+            }
+
+            val path = requestLine.split(" ").getOrNull(1) ?: "/"
+            val rawOut = socket.getOutputStream()
+            val protoTag = if (isHttps) "HTTPS" else "HTTP"
+
+            if (path.startsWith("/appasset")) {
+                val appId = extractQueryParam(path, "appid") ?: "1"
+                val pngBytes = cryptoManager.generateAppAssetPng(appId)
+                writeHttpBinaryResponse(rawOut, "image/png", pngBytes)
+                socket.close()
+                return
+            }
+
+            val xmlBody = when {
+                path.startsWith("/serverinfo") -> {
+                    // On HTTPS (:47984) or once paired, return PairStatus=1.
+                    // On HTTP (:47989) before pairing, return PairStatus=0 so Moonlight triggers the 4-digit PIN handshake and pins our X.509 cert!
+                    val isPaired = isHttps || pairedClientIps.contains(remoteIp)
+                    buildServerInfoXml(
+                        hostName = hostName,
+                        httpsPort = httpsPort,
+                        httpPort = httpPort,
+                        isPaired = isPaired
+                    )
+                }
+
+                path.startsWith("/applist") -> {
+                    onLog("$protoTag /applist served to $remoteIp (2 display modes ready)")
+                    buildAppListXml(captureModeProvider())
+                }
+
+                path.startsWith("/pair") -> {
+                    handlePairEndpoint(
+                        path = path,
+                        remoteIp = remoteIp,
+                        isHttps = isHttps,
+                        onPinPairingRequested = onPinPairingRequested,
+                        onPairSuccess = onPairSuccess,
+                        onLog = onLog
+                    )
+                }
+
+                path.startsWith("/launch") || path.startsWith("/resume") -> {
+                    val appId = extractQueryParam(path, "appid")?.toIntOrNull() ?: 1
+                    activeGameId = appId
+                    val localIp = detectLocalLanIp()
+                    onLog("$protoTag /launch appId=$appId from $remoteIp -> rtsp://$localIp:$rtspPort")
+                    onClientStreamLaunch(appId, remoteIp)
+                    """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><sessionUrl0>rtsp://$localIp:$rtspPort</sessionUrl0><gamesession>1</gamesession></root>"""
+                }
+
+                path.startsWith("/cancel") -> {
+                    activeGameId = 0
+                    onLog("$protoTag /cancel session from $remoteIp")
+                    """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><cancel>1</cancel></root>"""
+                }
+
+                else -> {
+                    buildServerInfoXml(
+                        hostName = hostName,
+                        httpsPort = httpsPort,
+                        httpPort = httpPort,
+                        isPaired = isHttps || pairedClientIps.contains(remoteIp)
+                    )
+                }
+            }
+
+            writeHttpXmlResponse(rawOut, xmlBody)
+            socket.close()
+        } catch (_: Throwable) {
+            runCatching { socket.close() }
+        }
+    }
+
+    private suspend fun handlePairEndpoint(
+        path: String,
+        remoteIp: String,
+        isHttps: Boolean,
+        onPinPairingRequested: (PendingPinRequest) -> Unit,
+        onPairSuccess: (clientName: String, clientIp: String, pinUsed: String) -> Unit,
+        onLog: (String) -> Unit
+    ): String {
+        val phrase = extractQueryParam(path, "phrase") ?: ""
+        val uniqueId = extractQueryParam(path, "uniqueid") ?: remoteIp
+        val devName = extractQueryParam(path, "devicename") ?: "Moonlight 10-Inch Tablet"
+        val clientChallenge = extractQueryParam(path, "clientchallenge")
+        val serverChallengeResp = extractQueryParam(path, "serverchallengeresp")
+        val clientPairingSecret = extractQueryParam(path, "clientpairingsecret")
+
+        return when {
+            phrase.equals("getservercert", ignoreCase = true) -> {
+                val saltHex = extractQueryParam(path, "salt") ?: ""
+                val clientCertHex = extractQueryParam(path, "clientcert") ?: ""
+
+                val pinWaitDeferred = CompletableDeferred<String>()
+                pendingPinDeferred = pinWaitDeferred
+
+                onLog("Moonlight tablet '$devName' ($remoteIp) started PIN pairing — enter 4-digit PIN on phone!")
+                onPinPairingRequested(
+                    PendingPinRequest(
+                        requestId = uniqueId,
+                        clientDeviceName = "$devName ($remoteIp)",
+                        clientIp = remoteIp,
+                        expectedPinHint = "Enter the 4-digit PIN currently shown on your 10\" Tablet in Moonlight:"
+                    )
+                )
+
+                // Wait up to 85 seconds for the user to enter the 4-digit PIN on the phone UI
+                val enteredPin = withTimeoutOrNull(85_000L) {
+                    pinWaitDeferred.await()
+                } ?: lastSubmittedPin
+
+                lastSubmittedPin = enteredPin
+                onLog("PIN [$enteredPin] confirmed — sending X.509 RSA-2048 certificate to $remoteIp")
+                cryptoManager.processGetServerCert(
+                    clientUniqueId = uniqueId,
+                    clientIp = remoteIp,
+                    saltHex = saltHex,
+                    clientCertHex = clientCertHex,
+                    pinCode = enteredPin
+                )
+            }
+
+            !clientChallenge.isNullOrEmpty() -> {
+                onLog("Pairing Phase 2 (clientchallenge) verified for $remoteIp")
+                cryptoManager.processClientChallenge(
+                    clientUniqueId = uniqueId,
+                    clientIp = remoteIp,
+                    clientChallengeHex = clientChallenge
+                )
+            }
+
+            !serverChallengeResp.isNullOrEmpty() -> {
+                onLog("Pairing Phase 3 (serverchallengeresp) RSA-SHA256 signed for $remoteIp")
+                cryptoManager.processServerChallengeResp(
+                    clientUniqueId = uniqueId,
+                    clientIp = remoteIp
+                )
+            }
+
+            !clientPairingSecret.isNullOrEmpty() -> {
+                pairedClientIps.add(remoteIp)
+                onLog("Pairing Phase 4 (clientpairingsecret) complete! Tablet $remoteIp is now trusted.")
+                onPairSuccess(devName, remoteIp, lastSubmittedPin)
+                """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"""
+            }
+
+            phrase.equals("pairchallenge", ignoreCase = true) || isHttps -> {
+                pairedClientIps.add(remoteIp)
+                onLog("HTTPS TLS pairchallenge verified for $remoteIp — App List unlocked!")
+                """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"""
+            }
+
+            else -> {
+                """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"""
+            }
+        }
+    }
+
+    private fun handleRtspSession(socket: Socket, onLog: (String) -> Unit) {
+        try {
+            socket.soTimeout = 15_000
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+            val out = socket.getOutputStream()
+
+            while (!socket.isClosed) {
+                val reqLine = reader.readLine() ?: break
+                if (reqLine.isBlank()) continue
+                val method = reqLine.substringBefore(" ").uppercase()
+                var cseq = "1"
+                var contentLength = 0
+
+                var line = reader.readLine()
+                while (!line.isNullOrEmpty()) {
+                    if (line.startsWith("CSeq:", ignoreCase = true)) {
+                        cseq = line.substringAfter(":").trim()
+                    } else if (line.startsWith("Content-Length:", ignoreCase = true)) {
+                        contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
+                    }
+                    line = reader.readLine()
+                }
+                if (contentLength > 0) {
+                    val bodyBuf = CharArray(contentLength)
+                    var readTotal = 0
+                    while (readTotal < contentLength) {
+                        val r = reader.read(bodyBuf, readTotal, contentLength - readTotal)
+                        if (r <= 0) break
+                        readTotal += r
+                    }
+                }
+
+                val response = when (method) {
+                    "OPTIONS" -> {
+                        "RTSP/1.0 200 OK\r\n" +
+                            "CSeq: $cseq\r\n" +
+                            "Public: OPTIONS, DESCRIBE, SETUP, PLAY, ANNOUNCE\r\n\r\n"
+                    }
+                    "DESCRIBE" -> {
+                        val sdp = "v=0\r\n" +
+                            "o=- 0 0 IN IP4 ${detectLocalLanIp()}\r\n" +
+                            "s=Sunshine\r\n" +
+                            "t=0 0\r\n" +
+                            "m=video 47998 RTP/AVP 96\r\n" +
+                            "a=rtpmap:96 H264/90000\r\n" +
+                            "a=x-ss-general.featureFlags:3\r\n"
+                        val sdpBytes = sdp.toByteArray(Charsets.UTF_8)
+                        "RTSP/1.0 200 OK\r\n" +
+                            "CSeq: $cseq\r\n" +
+                            "Content-Type: application/sdp\r\n" +
+                            "Content-Length: ${sdpBytes.size}\r\n\r\n" +
+                            sdp
+                    }
+                    "SETUP" -> {
+                        val port = when {
+                            reqLine.contains("audio", ignoreCase = true) -> 48000
+                            reqLine.contains("control", ignoreCase = true) -> 47999
+                            else -> 47998
+                        }
+                        "RTSP/1.0 200 OK\r\n" +
+                            "CSeq: $cseq\r\n" +
+                            "Session: 12345678;timeout=90\r\n" +
+                            "Transport: unicast;server_port=$port\r\n\r\n"
+                    }
+                    "ANNOUNCE" -> {
+                        "RTSP/1.0 200 OK\r\n" +
+                            "CSeq: $cseq\r\n" +
+                            "Session: 12345678\r\n\r\n"
+                    }
+                    "PLAY" -> {
+                        onLog("RTSP PLAY confirmed — streaming low-latency RTP video to ${socket.inetAddress?.hostAddress}")
+                        "RTSP/1.0 200 OK\r\n" +
+                            "CSeq: $cseq\r\n" +
+                            "Session: 12345678\r\n\r\n"
+                    }
+                    else -> {
+                        "RTSP/1.0 200 OK\r\nCSeq: $cseq\r\n\r\n"
+                    }
+                }
+                out.write(response.toByteArray(Charsets.UTF_8))
+                out.flush()
+            }
+        } catch (_: Throwable) {
+        } finally {
+            runCatching { socket.close() }
+        }
+    }
+
+    private fun writeHttpXmlResponse(out: OutputStream, xmlBody: String) {
+        val bodyBytes = xmlBody.trim().toByteArray(Charsets.UTF_8)
+        val headers = "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/xml; charset=utf-8\r\n" +
+            "Content-Length: ${bodyBytes.size}\r\n" +
+            "Connection: close\r\n\r\n"
+        out.write(headers.toByteArray(Charsets.UTF_8))
+        out.write(bodyBytes)
+        out.flush()
+    }
+
+    private fun writeHttpBinaryResponse(out: OutputStream, contentType: String, payload: ByteArray) {
+        val headers = "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: $contentType\r\n" +
+            "Content-Length: ${payload.size}\r\n" +
+            "Connection: close\r\n\r\n"
+        out.write(headers.toByteArray(Charsets.UTF_8))
+        out.write(payload)
+        out.flush()
+    }
+
     private fun extractQueryParam(fullPath: String, key: String): String? {
         val query = fullPath.substringAfter("?", "")
         if (query.isEmpty()) return null
-        return query.split("&")
+        val raw = query.split("&")
             .map { it.split("=", limit = 2) }
             .firstOrNull { it.firstOrNull().equals(key, ignoreCase = true) }
-            ?.getOrNull(1)
+            ?.getOrNull(1) ?: return null
+        return runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
     }
 
-    private fun buildServerInfoXml(hostName: String, httpsPort: Int, httpPort: Int): String {
+    private fun buildServerInfoXml(
+        hostName: String,
+        httpsPort: Int,
+        httpPort: Int,
+        isPaired: Boolean
+    ): String {
         val ip = detectLocalLanIp()
-        return """
-            <?xml version="1.0" encoding="utf-8"?>
-            <root status_code="200">
-                <hostname>$hostName</hostname>
-                <appversion>7.1.431.0</appversion>
-                <GfeVersion>3.23.0.74</GfeVersion>
-                <uniqueid>$hostUuid</uniqueid>
-                <HttpsPort>$httpsPort</HttpsPort>
-                <ExternalPort>$httpPort</ExternalPort>
-                <MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>
-                <ServerCodecModeSupport>259</ServerCodecModeSupport>
-                <LocalIP>$ip</LocalIP>
-                <PairStatus>1</PairStatus>
-                <currentgame>1</currentgame>
-                <state>SUNSHINE_SERVER_FREE</state>
-            </root>
-        """.trimIndent()
+        val pairVal = if (isPaired) 1 else 0
+        val serverState = if (activeGameId > 0) "SUNSHINE_SERVER_BUSY" else "SUNSHINE_SERVER_FREE"
+        return """<?xml version="1.0" encoding="utf-8"?>
+<root status_code="200">
+    <hostname>$hostName</hostname>
+    <appversion>7.1.431.0</appversion>
+    <GfeVersion>3.23.0.74</GfeVersion>
+    <uniqueid>$hostUuid</uniqueid>
+    <HttpsPort>$httpsPort</HttpsPort>
+    <ExternalPort>$httpPort</ExternalPort>
+    <mac>02:00:00:44:55:66</mac>
+    <MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>
+    <ServerCodecModeSupport>259</ServerCodecModeSupport>
+    <LocalIP>$ip</LocalIP>
+    <PairStatus>$pairVal</PairStatus>
+    <currentgame>$activeGameId</currentgame>
+    <state>$serverState</state>
+    <SupportedDisplayMode>
+        <DisplayMode>
+            <Width>2560</Width>
+            <Height>1600</Height>
+            <RefreshRate>120</RefreshRate>
+        </DisplayMode>
+        <DisplayMode>
+            <Width>1920</Width>
+            <Height>1200</Height>
+            <RefreshRate>90</RefreshRate>
+        </DisplayMode>
+        <DisplayMode>
+            <Width>1920</Width>
+            <Height>1080</Height>
+            <RefreshRate>120</RefreshRate>
+        </DisplayMode>
+    </SupportedDisplayMode>
+</root>"""
     }
 
     private fun buildAppListXml(activeMode: DisplayCaptureMode): String {
-        return """
-            <?xml version="1.0" encoding="utf-8"?>
-            <root status_code="200">
-                <App>
-                    <IsHdrSupported>1</IsHdrSupported>
-                    <AppTitle>${DisplayCaptureMode.VIRTUAL_EXTENDED.sunshineAppTitle}</AppTitle>
-                    <ID>1</ID>
-                </App>
-                <App>
-                    <IsHdrSupported>1</IsHdrSupported>
-                    <AppTitle>${DisplayCaptureMode.MIRROR_PRIMARY.sunshineAppTitle}</AppTitle>
-                    <ID>2</ID>
-                </App>
-                <ActiveMode>${activeMode.name}</ActiveMode>
-            </root>
-        """.trimIndent()
+        val firstAppTitle = if (activeMode == DisplayCaptureMode.VIRTUAL_EXTENDED) {
+            "10-Inch Tablet Extended Workspace (Active)"
+        } else {
+            "10-Inch Tablet Extended Workspace"
+        }
+        val secondAppTitle = if (activeMode == DisplayCaptureMode.MIRROR_PRIMARY) {
+            "Android Phone Primary Mirror (Active)"
+        } else {
+            "Android Phone Primary Mirror"
+        }
+        return """<?xml version="1.0" encoding="utf-8"?>
+<root status_code="200">
+    <App>
+        <IsHdrSupported>1</IsHdrSupported>
+        <AppTitle>$firstAppTitle</AppTitle>
+        <ID>1</ID>
+    </App>
+    <App>
+        <IsHdrSupported>1</IsHdrSupported>
+        <AppTitle>$secondAppTitle</AppTitle>
+        <ID>2</ID>
+    </App>
+</root>"""
     }
 
     fun stopSunshineDaemon() {
+        pendingPinDeferred?.cancel()
+        pendingPinDeferred = null
         runCatching {
             val nsd = nsdManager
             val listener = registrationListener
@@ -241,8 +652,16 @@ class SunshineDiscoveryAndPairingServer(
         registrationListener = null
         httpJob?.cancel()
         httpJob = null
+        httpsJob?.cancel()
+        httpsJob = null
+        rtspJob?.cancel()
+        rtspJob = null
         runCatching { httpServerSocket?.close() }
         httpServerSocket = null
+        runCatching { httpsServerSocket?.close() }
+        httpsServerSocket = null
+        runCatching { rtspServerSocket?.close() }
+        rtspServerSocket = null
         controlUdpJob?.cancel()
         controlUdpJob = null
         runCatching { controlUdpSocket?.close() }

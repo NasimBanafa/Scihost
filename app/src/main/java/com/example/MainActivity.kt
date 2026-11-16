@@ -487,8 +487,8 @@ private fun MoonlightPinPairingModal(
     onConfirmPin: (pin: String, clientName: String) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var pinCode by remember { mutableStateOf("4829") }
-    var tabletName by remember { mutableStateOf(request.clientDeviceName) }
+    var pinCode by remember(request.requestId) { mutableStateOf("") }
+    var tabletName by remember(request.requestId) { mutableStateOf(request.clientDeviceName) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -506,7 +506,21 @@ private fun MoonlightPinPairingModal(
                 Text(
                     text = request.expectedPinHint,
                     style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary
+                    color = TelemetryCyan
+                )
+                OutlinedTextField(
+                    value = pinCode,
+                    onValueChange = { input ->
+                        val digits = input.filter { it.isDigit() }.take(4)
+                        pinCode = digits
+                    },
+                    label = { Text("4-Digit PIN Shown on Tablet") },
+                    placeholder = { Text("Enter 4 digits from Moonlight") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("pin_code_input")
                 )
                 OutlinedTextField(
                     value = tabletName,
@@ -516,19 +530,6 @@ private fun MoonlightPinPairingModal(
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("pin_client_name_input")
-                )
-                OutlinedTextField(
-                    value = pinCode,
-                    onValueChange = { input ->
-                        val digits = input.filter { it.isDigit() }.take(4)
-                        pinCode = digits
-                    },
-                    label = { Text("4-Digit Moonlight PIN") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("pin_code_input")
                 )
             }
         },

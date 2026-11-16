@@ -17,6 +17,7 @@ import kotlinx.coroutines.launch
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 import kotlin.math.max
 import kotlin.random.Random
@@ -36,7 +37,14 @@ class HardwareEncoderEngine {
     private var activeCodec: MediaCodec? = null
     private var activeSurface: Surface? = null
     private var drainJob: Job? = null
+    private var pingListenerJob: Job? = null
     private var udpSocket: DatagramSocket? = null
+
+    @Volatile
+    private var dynamicClientAddress: InetAddress? = null
+
+    @Volatile
+    private var dynamicClientPort: Int = 47998
 
     /**
      * Queries the device's actual MediaCodecList to discover available hardware & software
@@ -81,7 +89,6 @@ class HardwareEncoderEngine {
                 }
             }
         } catch (_: Throwable) {
-            // Fallback in restricted unit test environments
         }
 
         if (results.isEmpty()) {
@@ -117,7 +124,7 @@ class HardwareEncoderEngine {
 
     /**
      * Initializes a zero-copy COLOR_FormatSurface hardware encoder pipeline with
-     * adaptive fallback across HEVC -> AVC -> AV1.
+     * adaptive fallback across HEVC -> AVC -> AV1 and binds UDP :47998 to receive Moonlight's UDP PING.
      */
     fun startSurfaceEncoder(
         preferredProfile: VideoCodecProfile,
@@ -183,7 +190,7 @@ class HardwareEncoderEngine {
                         }
                     )
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        setInteger(MediaFormat.KEY_PRIORITY, 0) // Realtime priority
+                        setInteger(MediaFormat.KEY_PRIORITY, 0)
                         setInteger(MediaFormat.KEY_OPERATING_RATE, max(fps, 120))
                     }
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -207,12 +214,46 @@ class HardwareEncoderEngine {
 
         activeCodec = chosenCodec
         activeSurface = chosenSurface
+        dynamicClientAddress = runCatching { InetAddress.getByName(targetClientIp) }.getOrNull()
+        dynamicClientPort = rtpPort
+
+        val boundSocket = runCatching {
+            DatagramSocket(null).apply {
+                reuseAddress = true
+                bind(InetSocketAddress(rtpPort))
+            }
+        }.recoverCatching { DatagramSocket() }.getOrNull()
+        udpSocket = boundSocket
+
+        // Listen on UDP 47998 for Moonlight's incoming UDP PING packet to lock onto tablet IP & ephemeral UDP port
+        pingListenerJob = scope.launch(Dispatchers.IO) {
+            val buf = ByteArray(128)
+            while (isActive && boundSocket != null && !boundSocket.isClosed) {
+                val pkt = DatagramPacket(buf, buf.size)
+                val ok = runCatching {
+                    boundSocket.receive(pkt)
+                    true
+                }.getOrDefault(false)
+                if (ok && pkt.address != null && pkt.port > 0) {
+                    val prevPort = dynamicClientPort
+                    dynamicClientAddress = pkt.address
+                    dynamicClientPort = pkt.port
+                    if (prevPort != pkt.port) {
+                        onLog("Moonlight UDP video PING received from ${pkt.address.hostAddress}:${pkt.port} — RTP stream locked")
+                        // Request an immediate IDR keyframe from MediaCodec when client connects
+                        runCatching {
+                            val params = android.os.Bundle().apply {
+                                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                            }
+                            activeCodec?.setParameters(params)
+                        }
+                    }
+                }
+            }
+        }
 
         // Launch RTP/UDP packetizer & encoder output buffer loop
         drainJob = scope.launch(Dispatchers.IO) {
-            val socket = runCatching { DatagramSocket() }.getOrNull()
-            udpSocket = socket
-            val destAddress = runCatching { InetAddress.getByName(targetClientIp) }.getOrNull()
             var sequenceNumber = Random.nextInt(1000, 9000)
             val bufferInfo = MediaCodec.BufferInfo()
 
@@ -221,7 +262,10 @@ class HardwareEncoderEngine {
                 var bytesThisCycle = 0
                 var packetsThisCycle = 0
 
+                val destAddress = dynamicClientAddress
+                val destPort = dynamicClientPort
                 val codecInstance = activeCodec
+
                 if (codecInstance != null) {
                     try {
                         var outIndex = codecInstance.dequeueOutputBuffer(bufferInfo, 4_000)
@@ -230,9 +274,9 @@ class HardwareEncoderEngine {
                             if (encodedData != null && bufferInfo.size > 0) {
                                 bytesThisCycle += bufferInfo.size
                                 packetsThisCycle += packetizeAndSendRtp(
-                                    socket = socket,
+                                    socket = boundSocket,
                                     destAddress = destAddress,
-                                    port = rtpPort,
+                                    port = destPort,
                                     payload = encodedData,
                                     payloadSize = bufferInfo.size,
                                     seqStart = sequenceNumber
@@ -243,14 +287,12 @@ class HardwareEncoderEngine {
                             outIndex = codecInstance.dequeueOutputBuffer(bufferInfo, 0)
                         }
                     } catch (_: Throwable) {
-                        // Continue telemetry pacing if surface has no dirty frames yet
                     }
                 }
 
-                // If screen is static or running in virtual surface standby, send RTP keepalive/FEC slices
                 if (packetsThisCycle == 0) {
                     packetsThisCycle = max(4, fps / 15)
-                    if (socket != null && destAddress != null) {
+                    if (boundSocket != null && destAddress != null) {
                         runCatching {
                             val rtpKeepAlive = ByteArray(12)
                             rtpKeepAlive[0] = 0x80.toByte()
@@ -258,7 +300,7 @@ class HardwareEncoderEngine {
                             rtpKeepAlive[2] = ((sequenceNumber shr 8) and 0xFF).toByte()
                             rtpKeepAlive[3] = (sequenceNumber and 0xFF).toByte()
                             sequenceNumber = (sequenceNumber + 1) and 0xFFFF
-                            socket.send(DatagramPacket(rtpKeepAlive, rtpKeepAlive.size, destAddress, rtpPort))
+                            boundSocket.send(DatagramPacket(rtpKeepAlive, rtpKeepAlive.size, destAddress, destPort))
                         }
                     }
                 }
@@ -288,6 +330,12 @@ class HardwareEncoderEngine {
         )
     }
 
+    fun updateTargetClientIp(ip: String) {
+        runCatching {
+            dynamicClientAddress = InetAddress.getByName(ip)
+        }
+    }
+
     private fun packetizeAndSendRtp(
         socket: DatagramSocket?,
         destAddress: InetAddress?,
@@ -307,7 +355,6 @@ class HardwareEncoderEngine {
 
         while (remaining > 0) {
             val chunk = minOf(remaining, mtuPayload)
-            // 12-byte RFC 3550 RTP Header for Sunshine/Moonlight video stream
             scratch[0] = 0x80.toByte()
             scratch[1] = if (remaining <= mtuPayload) (0x80 or 96).toByte() else 96.toByte()
             scratch[2] = ((seq shr 8) and 0xFF).toByte()
@@ -326,6 +373,8 @@ class HardwareEncoderEngine {
     }
 
     fun stopEncoder() {
+        pingListenerJob?.cancel()
+        pingListenerJob = null
         drainJob?.cancel()
         drainJob = null
         runCatching { udpSocket?.close() }
