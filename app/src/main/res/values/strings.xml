@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">SolisHost</string>
+    <string name="nav_command_deck">Deck</string>
+    <string name="nav_display_studio">Display &amp; Codec</string>
+    <string name="nav_moonlight_clients">Moonlight</string>
+    <string name="nav_root_kernel">Root Engine</string>
+    <string name="hero_banner_desc">Phone to 10-inch tablet wireless display topology</string>
+    <string name="host_status_active">SUNSHINE HOST STREAMING</string>
+    <string name="host_status_advertising">ADVERTISING _nvstream._tcp</string>
+    <string name="host_status_idle">HOST DAEMON STANDBY</string>
+    <string name="action_start_host">Start Sunshine Host</string>
+    <string name="action_stop_host">Stop Host Stream</string>
+    <string name="action_blank_oled">Blank Phone OLED</string>
+    <string name="action_pair_pin">Pair Tablet via PIN</string>
+    <string name="notification_channel_name">SolisHost Low-Latency Stream</string>
+    <string name="notification_title_streaming">SolisHost Active • Streaming to 10\" Tablet</string>
+    <string name="notification_body_streaming">Hardware encoder active over UDP/RTP low-latency link</string>
+</resources>

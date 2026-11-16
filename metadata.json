@@ -1,0 +1,6 @@
+{
+  "name": "SolisHost",
+  "description": "Sunshine-compatible low-latency Android display host for streaming phone to tablet with Root Mode and hardware MediaCodec encoding.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
