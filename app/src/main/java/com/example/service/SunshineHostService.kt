@@ -41,34 +41,52 @@ class SunshineHostService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val modeTitle = intent?.getStringExtra(EXTRA_MODE_TITLE) ?: "10\" Tablet Extended Display"
+        val modeTitle = intent?.getStringExtra(EXTRA_MODE_TITLE) ?: "Desktop (10\" Tablet Extended)"
         val codecBadge = intent?.getStringExtra(EXTRA_CODEC_BADGE) ?: "HEVC"
         val isMediaProjection = intent?.getBooleanExtra(EXTRA_HAS_PROJECTION, false) == true
 
         val notification = buildForegroundNotification(modeTitle, codecBadge)
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val fgType = if (isMediaProjection) {
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-                } else {
-                    0
-                }
+        promoteToForegroundSafely(notification, isMediaProjection)
+        acquireStreamWakeLock()
+        return START_STICKY
+    }
+
+    private fun promoteToForegroundSafely(notification: Notification, isMediaProjection: Boolean) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            if (isMediaProjection) {
+                val ok = runCatching {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                    )
+                    true
+                }.getOrDefault(false)
+                if (ok) return
+            }
+            runCatching {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val fgType = if (isMediaProjection) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            } else {
+                0
+            }
+            runCatching {
                 if (fgType != 0) {
                     startForeground(NOTIFICATION_ID, notification, fgType)
                 } else {
                     startForeground(NOTIFICATION_ID, notification)
                 }
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
             }
-        } catch (_: Throwable) {
+        } else {
             runCatching { startForeground(NOTIFICATION_ID, notification) }
         }
-
-        acquireStreamWakeLock()
-        return START_STICKY
     }
 
     /**
@@ -159,7 +177,7 @@ class SunshineHostService : Service() {
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "SolisHost::SunshineEncoderWakeLock"
             ).apply {
-                acquire(4 * 60 * 60 * 1000L) // Up to 4 hours per stream session
+                acquire(4 * 60 * 60 * 1000L)
             }
         }
     }
@@ -204,7 +222,7 @@ class SunshineHostService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon( android.R.drawable.stat_sys_upload_done )
+            .setSmallIcon(android.R.drawable.stat_sys_upload_done)
             .setContentTitle(getString(R.string.notification_title_streaming))
             .setContentText("$modeTitle • $codecBadge Hardware Zero-Copy")
             .setContentIntent(pendingIntent)

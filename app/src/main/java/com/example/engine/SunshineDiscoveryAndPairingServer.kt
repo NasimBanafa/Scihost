@@ -604,65 +604,42 @@ class SunshineDiscoveryAndPairingServer(
         val ip = detectLocalLanIp()
         val pairVal = if (isPaired) 1 else 0
         val serverState = if (activeGameId > 0) "SUNSHINE_SERVER_BUSY" else "SUNSHINE_SERVER_FREE"
-        return """<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200">
-    <hostname>$hostName</hostname>
-    <appversion>7.1.431.0</appversion>
-    <GfeVersion>3.23.0.74</GfeVersion>
-    <uniqueid>$hostUuid</uniqueid>
-    <HttpsPort>$httpsPort</HttpsPort>
-    <ExternalPort>$httpPort</ExternalPort>
-    <mac>02:00:00:44:55:66</mac>
-    <MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>
-    <ServerCodecModeSupport>259</ServerCodecModeSupport>
-    <LocalIP>$ip</LocalIP>
-    <PairStatus>$pairVal</PairStatus>
-    <currentgame>$activeGameId</currentgame>
-    <state>$serverState</state>
-    <SupportedDisplayMode>
-        <DisplayMode>
-            <Width>2560</Width>
-            <Height>1600</Height>
-            <RefreshRate>120</RefreshRate>
-        </DisplayMode>
-        <DisplayMode>
-            <Width>1920</Width>
-            <Height>1200</Height>
-            <RefreshRate>90</RefreshRate>
-        </DisplayMode>
-        <DisplayMode>
-            <Width>1920</Width>
-            <Height>1080</Height>
-            <RefreshRate>120</RefreshRate>
-        </DisplayMode>
-    </SupportedDisplayMode>
-</root>"""
+        return buildString {
+            append("""<?xml version="1.0" encoding="utf-8"?>""")
+            append("""<root status_code="200">""")
+            append("<hostname>$hostName</hostname>")
+            append("<appversion>7.1.431.0</appversion>")
+            append("<GfeVersion>3.23.0.74</GfeVersion>")
+            append("<uniqueid>$hostUuid</uniqueid>")
+            append("<HttpsPort>$httpsPort</HttpsPort>")
+            append("<ExternalPort>$httpPort</ExternalPort>")
+            append("<mac>02:00:00:44:55:66</mac>")
+            append("<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>")
+            append("<ServerCodecModeSupport>259</ServerCodecModeSupport>")
+            append("<LocalIP>$ip</LocalIP>")
+            append("<PairStatus>$pairVal</PairStatus>")
+            append("<currentgame>$activeGameId</currentgame>")
+            append("<state>$serverState</state>")
+            append("<SupportedDisplayMode>")
+            append("<DisplayMode><Width>2560</Width><Height>1600</Height><RefreshRate>120</RefreshRate></DisplayMode>")
+            append("<DisplayMode><Width>1920</Width><Height>1200</Height><RefreshRate>90</RefreshRate></DisplayMode>")
+            append("<DisplayMode><Width>1920</Width><Height>1080</Height><RefreshRate>120</RefreshRate></DisplayMode>")
+            append("</SupportedDisplayMode>")
+            append("</root>")
+        }
     }
 
     private fun buildAppListXml(activeMode: DisplayCaptureMode): String {
-        val firstAppTitle = if (activeMode == DisplayCaptureMode.VIRTUAL_EXTENDED) {
-            "10-Inch Tablet Extended Workspace (Active)"
-        } else {
-            "10-Inch Tablet Extended Workspace"
+        // CRITICAL: Zero inter-tag whitespace/newlines so Moonlight's XmlPullParser never fires
+        // XmlPullParser.TEXT before the first <App> tag (which otherwise throws NoSuchElementException on appList.getLast()!)
+        return buildString {
+            append("""<?xml version="1.0" encoding="utf-8"?>""")
+            append("""<root status_code="200">""")
+            append("<App><IsHdrSupported>0</IsHdrSupported><AppTitle>Desktop</AppTitle><ID>1</ID></App>")
+            append("<App><IsHdrSupported>0</IsHdrSupported><AppTitle>10-Inch Tablet Extended Display</AppTitle><ID>2</ID></App>")
+            append("<App><IsHdrSupported>0</IsHdrSupported><AppTitle>Phone Screen Mirror</AppTitle><ID>3</ID></App>")
+            append("</root>")
         }
-        val secondAppTitle = if (activeMode == DisplayCaptureMode.MIRROR_PRIMARY) {
-            "Android Phone Primary Mirror (Active)"
-        } else {
-            "Android Phone Primary Mirror"
-        }
-        return """<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200">
-    <App>
-        <IsHdrSupported>1</IsHdrSupported>
-        <AppTitle>$firstAppTitle</AppTitle>
-        <ID>1</ID>
-    </App>
-    <App>
-        <IsHdrSupported>1</IsHdrSupported>
-        <AppTitle>$secondAppTitle</AppTitle>
-        <ID>2</ID>
-    </App>
-</root>"""
     }
 
     fun stopSunshineDaemon() {

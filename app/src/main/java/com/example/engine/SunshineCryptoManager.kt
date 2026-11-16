@@ -175,11 +175,7 @@ class SunshineCryptoManager(private val context: Context) {
         sessions[clientUniqueId] = session
         sessions[clientIp] = session
 
-        return """<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200">
-    <paired>1</paired>
-    <plaincert>$serverCertPemHex</plaincert>
-</root>"""
+        return """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><plaincert>$serverCertPemHex</plaincert></root>"""
     }
 
     /**
@@ -218,11 +214,7 @@ class SunshineCryptoManager(private val context: Context) {
         val encryptedResponse = aesEcbEncrypt(plainResponse, session.aesKeySha256)
         val responseHex = bytesToHex(encryptedResponse)
 
-        return """<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200">
-    <paired>1</paired>
-    <challengeresponse>$responseHex</challengeresponse>
-</root>"""
+        return """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><challengeresponse>$responseHex</challengeresponse></root>"""
     }
 
     /**
@@ -245,11 +237,7 @@ class SunshineCryptoManager(private val context: Context) {
         System.arraycopy(serverSecret, 0, pairingSecret, 0, serverSecret.size)
         System.arraycopy(signatureBytes, 0, pairingSecret, serverSecret.size, signatureBytes.size)
 
-        return """<?xml version="1.0" encoding="utf-8"?>
-<root status_code="200">
-    <paired>1</paired>
-    <pairingsecret>${bytesToHex(pairingSecret)}</pairingsecret>
-</root>"""
+        return """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><pairingsecret>${bytesToHex(pairingSecret)}</pairingsecret></root>"""
     }
 
     fun updateActiveSessionPin(pinCode: String) {

@@ -157,10 +157,12 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
                     saveVerifiedPairedClient(devName, clientIp, pinUsed)
                 },
                 onClientStreamLaunch = { appId, clientIp ->
-                    val launchedMode = if (appId == 2) {
-                        DisplayCaptureMode.MIRROR_PRIMARY
-                    } else {
-                        DisplayCaptureMode.VIRTUAL_EXTENDED
+                    val launchedMode = when (appId) {
+                        3 -> DisplayCaptureMode.MIRROR_PRIMARY
+                        2 -> DisplayCaptureMode.VIRTUAL_EXTENDED
+                        else -> runCatching {
+                            DisplayCaptureMode.valueOf(hostConfig.value.captureModeName)
+                        }.getOrDefault(DisplayCaptureMode.VIRTUAL_EXTENDED)
                     }
                     encoderEngine.updateTargetClientIp(clientIp)
                     updateDisplayCaptureMode(launchedMode)
@@ -213,7 +215,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
                 .getOrDefault(VideoCodecProfile.HEVC_H265)
             val targetClientIp = pairedClients.value.firstOrNull()?.clientIpAddress ?: "192.168.1.142"
 
-            // 1. Start Foreground Service
+            // 1. Start Service safely without triggering ForegroundServiceDidNotStartInTimeException
             val app = getApplication<Application>()
             val serviceIntent = Intent(app, SunshineHostService::class.java).apply {
                 putExtra(SunshineHostService.EXTRA_MODE_TITLE, mode.sunshineAppTitle)
@@ -221,11 +223,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
                 putExtra(SunshineHostService.EXTRA_HAS_PROJECTION, mediaProjectionData != null)
             }
             runCatching {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    app.startForegroundService(serviceIntent)
-                } else {
-                    app.startService(serviceIntent)
-                }
+                app.startService(serviceIntent)
                 app.bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
             }
 
