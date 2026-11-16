@@ -60,6 +60,7 @@ fun MoonlightClientsScreen(
     telemetry: StreamTelemetry,
     pairedClients: List<PairedClientEntity>,
     onTriggerPinPairing: () -> Unit,
+    onResetPairing: () -> Unit,
     onConnectClient: (PairedClientEntity) -> Unit,
     onRemoveClient: (Int) -> Unit,
     modifier: Modifier = Modifier
@@ -141,6 +142,22 @@ fun MoonlightClientsScreen(
                         Text(
                             text = "Enter 4-Digit Moonlight Tablet PIN",
                             style = MaterialTheme.typography.labelLarge
+                        )
+                    }
+
+                    androidx.compose.material3.OutlinedButton(
+                        onClick = onResetPairing,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(46.dp)
+                            .testTag("reset_pairing_uuid_button"),
+                        shape = RoundedCornerShape(14.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, TelemetryCyan)
+                    ) {
+                        Text(
+                            text = "Reset Host ID & Force Tablet PIN Prompt",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = TelemetryCyan
                         )
                     }
                 }

@@ -12,10 +12,11 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.math.BigInteger
+import java.net.Socket
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
-import java.security.KeyStore
 import java.security.MessageDigest
+import java.security.Principal
 import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.Signature
@@ -29,9 +30,11 @@ import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import javax.crypto.spec.SecretKeySpec
-import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.KeyManager
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLEngine
 import javax.net.ssl.TrustManager
+import javax.net.ssl.X509ExtendedKeyManager
 import javax.net.ssl.X509TrustManager
 
 data class PairingSessionState(
@@ -100,22 +103,41 @@ class SunshineCryptoManager(private val context: Context) {
     }
 
     /**
-     * Creates an SSLContext configured with our Sunshine server X.509 certificate and RSA private key,
-     * plus a permissive X509TrustManager that accepts Moonlight's self-signed client certificates.
+     * Creates an SSLContext backed by a direct X509ExtendedKeyManager that unconditionally serves
+     * our Sunshine X.509 certificate and RSA-2048 private key across all Android TLS versions.
      */
     fun createServerSslContext(): SSLContext {
-        val keyStore = KeyStore.getInstance(KeyStore.getDefaultType()).apply {
-            load(null, null)
-            setKeyEntry(
-                "sunshine",
-                serverPrivateKey,
-                "sunshine".toCharArray(),
+        val directKeyManager = object : X509ExtendedKeyManager() {
+            override fun getClientAliases(keyType: String?, issuers: Array<out Principal>?): Array<String> =
+                arrayOf("sunshine")
+
+            override fun chooseClientAlias(
+                keyType: Array<out String>?,
+                issuers: Array<out Principal>?,
+                socket: Socket?
+            ): String = "sunshine"
+
+            override fun getServerAliases(keyType: String?, issuers: Array<out Principal>?): Array<String> =
+                arrayOf("sunshine")
+
+            override fun chooseServerAlias(
+                keyType: String?,
+                issuers: Array<out Principal>?,
+                socket: Socket?
+            ): String = "sunshine"
+
+            override fun chooseEngineServerAlias(
+                keyType: String?,
+                issuers: Array<out Principal>?,
+                engine: SSLEngine?
+            ): String = "sunshine"
+
+            override fun getCertificateChain(alias: String?): Array<X509Certificate> =
                 arrayOf(serverCertificate)
-            )
+
+            override fun getPrivateKey(alias: String?): PrivateKey = serverPrivateKey
         }
-        val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply {
-            init(keyStore, "sunshine".toCharArray())
-        }
+
         val trustAllClients = arrayOf<TrustManager>(
             object : X509TrustManager {
                 override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
@@ -124,7 +146,7 @@ class SunshineCryptoManager(private val context: Context) {
             }
         )
         return SSLContext.getInstance("TLS").apply {
-            init(kmf.keyManagers, trustAllClients, secureRandom)
+            init(arrayOf<KeyManager>(directKeyManager), trustAllClients, secureRandom)
         }
     }
 
@@ -153,13 +175,11 @@ class SunshineCryptoManager(private val context: Context) {
         sessions[clientUniqueId] = session
         sessions[clientIp] = session
 
-        return """
-            <?xml version="1.0" encoding="utf-8"?>
-            <root status_code="200">
-                <paired>1</paired>
-                <plaincert>$serverCertPemHex</plaincert>
-            </root>
-        """.trimIndent()
+        return """<?xml version="1.0" encoding="utf-8"?>
+<root status_code="200">
+    <paired>1</paired>
+    <plaincert>$serverCertPemHex</plaincert>
+</root>"""
     }
 
     /**
@@ -198,13 +218,11 @@ class SunshineCryptoManager(private val context: Context) {
         val encryptedResponse = aesEcbEncrypt(plainResponse, session.aesKeySha256)
         val responseHex = bytesToHex(encryptedResponse)
 
-        return """
-            <?xml version="1.0" encoding="utf-8"?>
-            <root status_code="200">
-                <paired>1</paired>
-                <challengeresponse>$responseHex</challengeresponse>
-            </root>
-        """.trimIndent()
+        return """<?xml version="1.0" encoding="utf-8"?>
+<root status_code="200">
+    <paired>1</paired>
+    <challengeresponse>$responseHex</challengeresponse>
+</root>"""
     }
 
     /**
@@ -227,13 +245,11 @@ class SunshineCryptoManager(private val context: Context) {
         System.arraycopy(serverSecret, 0, pairingSecret, 0, serverSecret.size)
         System.arraycopy(signatureBytes, 0, pairingSecret, serverSecret.size, signatureBytes.size)
 
-        return """
-            <?xml version="1.0" encoding="utf-8"?>
-            <root status_code="200">
-                <paired>1</paired>
-                <pairingsecret>${bytesToHex(pairingSecret)}</pairingsecret>
-            </root>
-        """.trimIndent()
+        return """<?xml version="1.0" encoding="utf-8"?>
+<root status_code="200">
+    <paired>1</paired>
+    <pairingsecret>${bytesToHex(pairingSecret)}</pairingsecret>
+</root>"""
     }
 
     fun updateActiveSessionPin(pinCode: String) {
@@ -311,7 +327,6 @@ class SunshineCryptoManager(private val context: Context) {
             bmp.recycle()
             out.toByteArray()
         } catch (_: Throwable) {
-            // 1x1 valid transparent PNG fallback for headless JVM unit tests
             Base64.decode(
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
                 Base64.DEFAULT
@@ -338,7 +353,6 @@ class SunshineCryptoManager(private val context: Context) {
 
         // Version v3: [0] EXPLICIT INTEGER 2
         val versionExplicit = derTag(0xA0, byteArrayOf(0x02, 0x01, 0x02))
-        // SerialNumber
         val serialBytes = BigInteger(64, secureRandom).abs().max(BigInteger.ONE).toByteArray()
         val serialDer = derTag(0x02, serialBytes)
 
@@ -348,7 +362,6 @@ class SunshineCryptoManager(private val context: Context) {
         val rdnSet = derTag(0x31, derSequence(cnOid + cnVal))
         val nameSeq = derSequence(rdnSet)
 
-        // Validity
         val utcFmt = SimpleDateFormat("yyMMddHHmmss'Z'", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
         }
@@ -356,7 +369,6 @@ class SunshineCryptoManager(private val context: Context) {
             derUtcTime(utcFmt.format(notBefore)) + derUtcTime(utcFmt.format(notAfter))
         )
 
-        // SubjectPublicKeyInfo (already X.509 DER encoded by Java RSA PublicKey!)
         val spkiDer = kp.public.encoded
 
         val tbsBytes = derSequence(

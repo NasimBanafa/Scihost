@@ -459,6 +459,15 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
         )
     }
 
+    fun resetPairingAndForcePinPrompt() {
+        val newUuid = discoveryServer.resetPairingStateAndRotateUuid()
+        appendLog(
+            subsystem = "PAIR-RESET",
+            message = "Cleared paired state & rotated Sunshine Host UUID ($newUuid) — Moonlight tablet will now prompt with a new 4-digit PIN!",
+            isPrivileged = false
+        )
+    }
+
     fun dismissPinDialog() {
         _pendingPinRequest.value = null
     }

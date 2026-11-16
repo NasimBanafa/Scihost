@@ -238,6 +238,7 @@ fun SolisHostApp(
                                 telemetry = telemetry,
                                 pairedClients = pairedClients,
                                 onTriggerPinPairing = { viewModel.triggerIncomingTabletPairRequest() },
+                                onResetPairing = viewModel::resetPairingAndForcePinPrompt,
                                 onConnectClient = viewModel::connectToPairedClient,
                                 onRemoveClient = viewModel::removePairedClient
                             )

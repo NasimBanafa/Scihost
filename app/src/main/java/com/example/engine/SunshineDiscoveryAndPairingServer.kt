@@ -32,6 +32,7 @@ class SunshineDiscoveryAndPairingServer(
     private val context: Context
 ) {
     val cryptoManager = SunshineCryptoManager(context)
+    private val prefs = context.getSharedPreferences("solishost_pairing_prefs", Context.MODE_PRIVATE)
 
     private var nsdManager: NsdManager? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
@@ -46,19 +47,47 @@ class SunshineDiscoveryAndPairingServer(
     private var controlUdpJob: Job? = null
     private var controlUdpSocket: DatagramSocket? = null
 
-    // Tracks IPs that have completed cryptographic pairing or connected via TLS with a pinned cert
-    private val pairedClientIps: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+    // Tracks IPs / uniqueIds that have completed the 4-phase cryptographic /pair exchange
+    private val pairedClientIps: MutableSet<String> = Collections.synchronizedSet(
+        (prefs.getStringSet("paired_ips_v3", emptySet()) ?: emptySet()).toMutableSet()
+    )
 
     @Volatile
     private var pendingPinDeferred: CompletableDeferred<String>? = null
 
     @Volatile
-    private var lastSubmittedPin: String = "4829"
+    private var lastSubmittedPin: String = "1234"
 
     @Volatile
     private var activeGameId: Int = 0
 
-    val hostUuid: String = UUID.nameUUIDFromBytes("SolisHost-Sunshine-v2-TLS".toByteArray()).toString()
+    @Volatile
+    var hostUuid: String = prefs.getString("host_uuid_v3", null) ?: run {
+        val fresh = UUID.randomUUID().toString()
+        prefs.edit().putString("host_uuid_v3", fresh).apply()
+        fresh
+    }
+        private set
+
+    /**
+     * Clears paired client state and rotates the Sunshine host uniqueid so Moonlight on the tablet
+     * immediately drops any stale cache and prompts with a fresh 4-digit PIN.
+     */
+    fun resetPairingStateAndRotateUuid(): String {
+        pairedClientIps.clear()
+        val newUuid = UUID.randomUUID().toString()
+        hostUuid = newUuid
+        prefs.edit()
+            .remove("paired_ips_v3")
+            .putString("host_uuid_v3", newUuid)
+            .apply()
+        return newUuid
+    }
+
+    private fun markClientPaired(ip: String) {
+        pairedClientIps.add(ip)
+        prefs.edit().putStringSet("paired_ips_v3", pairedClientIps.toSet()).apply()
+    }
 
     fun detectLocalLanIp(): String {
         try {
@@ -133,7 +162,7 @@ class SunshineDiscoveryAndPairingServer(
             onLog("mDNS init note: ${t.javaClass.simpleName}")
         }
 
-        // 2. Start HTTP Server on Port 47989 (/serverinfo, /pair phases 1-4, /applist fallback)
+        // 2. Start HTTP Server on Port 47989 (/serverinfo ALWAYS PairStatus=0, /pair phases 1-4)
         httpJob = scope.launch(Dispatchers.IO) {
             val server = runCatching {
                 ServerSocket().apply {
@@ -167,13 +196,13 @@ class SunshineDiscoveryAndPairingServer(
             }
         }
 
-        // 3. Start HTTPS / TLS Server on Port 47984 (/applist, /appasset, /serverinfo, /launch, /resume, /pairchallenge)
+        // 3. Start HTTPS / TLS Server on Port 47984 (/applist, /appasset, /serverinfo PairStatus=1, /launch, /resume, /pairchallenge)
         httpsJob = scope.launch(Dispatchers.IO) {
             val sslServer = runCatching {
                 val sslContext = cryptoManager.createServerSslContext()
                 (sslContext.serverSocketFactory.createServerSocket() as SSLServerSocket).apply {
                     reuseAddress = true
-                    wantClientAuth = true
+                    wantClientAuth = false
                     needClientAuth = false
                     bind(InetSocketAddress(httpsPort))
                 }
@@ -183,7 +212,7 @@ class SunshineDiscoveryAndPairingServer(
             if (sslServer != null) {
                 onLog("Sunshine HTTPS/TLS server online at ${detectLocalLanIp()}:${sslServer.localPort} (X.509 RSA-2048 ready)")
             } else {
-                onLog("HTTPS port $httpsPort bind warning — check if another instance is running")
+                onLog("HTTPS port $httpsPort bind warning")
             }
 
             while (isActive && sslServer != null && !sslServer.isClosed) {
@@ -191,7 +220,7 @@ class SunshineDiscoveryAndPairingServer(
                 launch(Dispatchers.IO) {
                     runCatching {
                         sslClient.useClientMode = false
-                        sslClient.wantClientAuth = true
+                        sslClient.wantClientAuth = false
                         sslClient.needClientAuth = false
                     }
                     handleHttpOrHttpsClient(
@@ -279,10 +308,6 @@ class SunshineDiscoveryAndPairingServer(
         try {
             socket.soTimeout = if (isHttps) 15_000 else 95_000
             val remoteIp = socket.inetAddress?.hostAddress ?: "192.168.1.142"
-            if (isHttps) {
-                // Any client that completes a TLS handshake with our pinned server cert is paired
-                pairedClientIps.add(remoteIp)
-            }
 
             val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
             val requestLine = reader.readLine() ?: return
@@ -306,9 +331,10 @@ class SunshineDiscoveryAndPairingServer(
 
             val xmlBody = when {
                 path.startsWith("/serverinfo") -> {
-                    // On HTTPS (:47984) or once paired, return PairStatus=1.
-                    // On HTTP (:47989) before pairing, return PairStatus=0 so Moonlight triggers the 4-digit PIN handshake and pins our X.509 cert!
-                    val isPaired = isHttps || pairedClientIps.contains(remoteIp)
+                    // CRITICAL SUNSHINE RULE (from nvhttp.cpp):
+                    // Plain HTTP (:47989) /serverinfo MUST ALWAYS return PairStatus=0!
+                    // Only HTTPS (:47984) returns PairStatus=1 once the client has completed /pair!
+                    val isPaired = isHttps && pairedClientIps.contains(remoteIp)
                     buildServerInfoXml(
                         hostName = hostName,
                         httpsPort = httpsPort,
@@ -318,7 +344,7 @@ class SunshineDiscoveryAndPairingServer(
                 }
 
                 path.startsWith("/applist") -> {
-                    onLog("$protoTag /applist served to $remoteIp (2 display modes ready)")
+                    onLog("$protoTag /applist served to $remoteIp")
                     buildAppListXml(captureModeProvider())
                 }
 
@@ -353,7 +379,7 @@ class SunshineDiscoveryAndPairingServer(
                         hostName = hostName,
                         httpsPort = httpsPort,
                         httpPort = httpPort,
-                        isPaired = isHttps || pairedClientIps.contains(remoteIp)
+                        isPaired = isHttps && pairedClientIps.contains(remoteIp)
                     )
                 }
             }
@@ -388,10 +414,10 @@ class SunshineDiscoveryAndPairingServer(
                 val pinWaitDeferred = CompletableDeferred<String>()
                 pendingPinDeferred = pinWaitDeferred
 
-                onLog("Moonlight tablet '$devName' ($remoteIp) started PIN pairing — enter 4-digit PIN on phone!")
+                onLog("PIN PROMPT TRIGGERED: Tablet '$devName' ($remoteIp) waiting for 4-digit PIN!")
                 onPinPairingRequested(
                     PendingPinRequest(
-                        requestId = uniqueId,
+                        requestId = "$uniqueId-${System.currentTimeMillis()}",
                         clientDeviceName = "$devName ($remoteIp)",
                         clientIp = remoteIp,
                         expectedPinHint = "Enter the 4-digit PIN currently shown on your 10\" Tablet in Moonlight:"
@@ -404,7 +430,7 @@ class SunshineDiscoveryAndPairingServer(
                 } ?: lastSubmittedPin
 
                 lastSubmittedPin = enteredPin
-                onLog("PIN [$enteredPin] confirmed — sending X.509 RSA-2048 certificate to $remoteIp")
+                onLog("PIN [$enteredPin] entered — sending X.509 RSA-2048 certificate to $remoteIp")
                 cryptoManager.processGetServerCert(
                     clientUniqueId = uniqueId,
                     clientIp = remoteIp,
@@ -432,14 +458,14 @@ class SunshineDiscoveryAndPairingServer(
             }
 
             !clientPairingSecret.isNullOrEmpty() -> {
-                pairedClientIps.add(remoteIp)
+                markClientPaired(remoteIp)
                 onLog("Pairing Phase 4 (clientpairingsecret) complete! Tablet $remoteIp is now trusted.")
                 onPairSuccess(devName, remoteIp, lastSubmittedPin)
                 """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"""
             }
 
             phrase.equals("pairchallenge", ignoreCase = true) || isHttps -> {
-                pairedClientIps.add(remoteIp)
+                markClientPaired(remoteIp)
                 onLog("HTTPS TLS pairchallenge verified for $remoteIp — App List unlocked!")
                 """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired></root>"""
             }
