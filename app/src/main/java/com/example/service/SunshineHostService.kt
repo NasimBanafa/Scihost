@@ -46,43 +46,26 @@ class SunshineHostService : Service() {
         val isMediaProjection = intent?.getBooleanExtra(EXTRA_HAS_PROJECTION, false) == true
 
         val notification = buildForegroundNotification(modeTitle, codecBadge)
-        promoteToForegroundSafely(notification, isMediaProjection)
+        if (isMediaProjection) {
+            promoteToMediaProjectionForeground(notification)
+        } else {
+            runCatching {
+                val nm = getSystemService(NotificationManager::class.java)
+                nm?.notify(NOTIFICATION_ID, notification)
+            }
+        }
         acquireStreamWakeLock()
         return START_STICKY
     }
 
-    private fun promoteToForegroundSafely(notification: Notification, isMediaProjection: Boolean) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            if (isMediaProjection) {
-                val ok = runCatching {
-                    startForeground(
-                        NOTIFICATION_ID,
-                        notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                    )
-                    true
-                }.getOrDefault(false)
-                if (ok) return
-            }
+    private fun promoteToMediaProjectionForeground(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             runCatching {
                 startForeground(
                     NOTIFICATION_ID,
                     notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
                 )
-            }
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val fgType = if (isMediaProjection) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            } else {
-                0
-            }
-            runCatching {
-                if (fgType != 0) {
-                    startForeground(NOTIFICATION_ID, notification, fgType)
-                } else {
-                    startForeground(NOTIFICATION_ID, notification)
-                }
             }
         } else {
             runCatching { startForeground(NOTIFICATION_ID, notification) }
@@ -105,9 +88,12 @@ class SunshineHostService : Service() {
     ): Int {
         releaseVirtualDisplay()
 
-        // 1. If MediaProjection token was provided, create MediaProjection VirtualDisplay
+        // 1. If MediaProjection token was provided, promote to FGS and create MediaProjection VirtualDisplay
         if (resultCode != null && projectionData != null && encoderSurface != null) {
             try {
+                val notification = buildForegroundNotification(captureMode.sunshineAppTitle, "HEVC")
+                promoteToMediaProjectionForeground(notification)
+
                 val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                 val projection = mpManager.getMediaProjection(resultCode, projectionData)
                 projection?.registerCallback(object : MediaProjection.Callback() {
@@ -187,6 +173,10 @@ class SunshineHostService : Service() {
         virtualDisplay = null
         runCatching { mediaProjection?.stop() }
         mediaProjection = null
+        runCatching {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.cancel(NOTIFICATION_ID)
+        }
     }
 
     override fun onDestroy() {

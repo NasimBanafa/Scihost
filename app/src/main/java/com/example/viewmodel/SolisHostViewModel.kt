@@ -5,7 +5,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.os.Build
 import android.os.IBinder
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -26,6 +25,7 @@ import com.example.model.StreamTelemetry
 import com.example.model.TabletResolutionPreset
 import com.example.model.VideoCodecProfile
 import com.example.service.SunshineHostService
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -34,6 +34,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -108,9 +109,17 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
     init {
+        val app = getApplication<Application>()
+        runCatching {
+            val bindIntent = Intent(app, SunshineHostService::class.java)
+            app.bindService(bindIntent, serviceConnection, Context.BIND_AUTO_CREATE)
+        }
+
         viewModelScope.launch {
             repository.ensureDefaultData()
-            val encoders = encoderEngine.probeDeviceEncoders()
+            val encoders = withContext(Dispatchers.IO) {
+                encoderEngine.probeDeviceEncoders()
+            }
             _hardwareEncoders.value = encoders
             appendLog(
                 subsystem = "MEDIACODEC",
@@ -128,7 +137,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun refreshRootCapabilities() {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             val report = rootManager.probeRootAndKernel { sub, msg, priv, warn ->
                 appendLog(sub, msg, priv, warn)
             }
@@ -137,13 +146,14 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun startSunshineDiscoveryDaemonOnly() {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             val cfg = repository.getOrCreateConfig()
             val preset = runCatching { TabletResolutionPreset.valueOf(cfg.resolutionPresetName) }
                 .getOrDefault(TabletResolutionPreset.WUXGA_1920_1200)
 
             discoveryServer.startSunshineDaemon(
                 hostName = cfg.hostName,
+                forceRestart = false,
                 captureModeProvider = {
                     runCatching { DisplayCaptureMode.valueOf(hostConfig.value.captureModeName) }
                         .getOrDefault(DisplayCaptureMode.VIRTUAL_EXTENDED)
@@ -173,7 +183,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
                 onReturnInputPacket = { nx, ny, isStylus, pressure ->
                     _telemetry.update { it.copy(returnInputRateHz = (it.returnInputRateHz + 15).coerceAtMost(240)) }
                     if (hostConfig.value.rootModeEnabled && hostConfig.value.rootUinputInjection) {
-                        viewModelScope.launch {
+                        viewModelScope.launch(Dispatchers.IO) {
                             rootManager.injectTabletTouchOrStylusEvent(
                                 displayId = _telemetry.value.virtualDisplayId,
                                 normalizedX = nx,
@@ -205,7 +215,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
         mediaProjectionResultCode: Int? = null,
         mediaProjectionData: Intent? = null
     ) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             val cfg = repository.getOrCreateConfig()
             val mode = runCatching { DisplayCaptureMode.valueOf(cfg.captureModeName) }
                 .getOrDefault(DisplayCaptureMode.VIRTUAL_EXTENDED)
@@ -215,7 +225,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
                 .getOrDefault(VideoCodecProfile.HEVC_H265)
             val targetClientIp = pairedClients.value.firstOrNull()?.clientIpAddress ?: "192.168.1.142"
 
-            // 1. Start Service safely without triggering ForegroundServiceDidNotStartInTimeException
+            // 1. Start Service safely without triggering SecurityException or FGS timeout
             val app = getApplication<Application>()
             val serviceIntent = Intent(app, SunshineHostService::class.java).apply {
                 putExtra(SunshineHostService.EXTRA_MODE_TITLE, mode.sunshineAppTitle)
@@ -224,7 +234,9 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
             }
             runCatching {
                 app.startService(serviceIntent)
-                app.bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
+                if (!isServiceBound) {
+                    app.bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
+                }
             }
 
             // 2. Apply Root Mode CPU/GPU Governor & SurfaceFlinger acceleration if enabled
@@ -238,8 +250,10 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
 
-            // 3. Ensure Sunshine HTTP (:47989) + HTTPS (:47984) + RTSP (:48010) Server is running
-            startSunshineDiscoveryDaemonOnly()
+            // 3. Ensure Sunshine HTTP (:47989) + HTTPS (:47984) + RTSP (:48010) Server is running without resetting sockets
+            if (!discoveryServer.isDaemonRunning()) {
+                startSunshineDiscoveryDaemonOnly()
+            }
 
             // 4. Start Zero-Copy Hardware Surface Encoder & RTP/UDP Streamer
             val session = encoderEngine.startSurfaceEncoder(
@@ -272,16 +286,18 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
             )
 
             // 5. Bind VirtualDisplay to the Hardware Encoder's InputSurface
-            val displayId = boundService?.bindDisplayCaptureSurface(
-                resultCode = mediaProjectionResultCode,
-                projectionData = mediaProjectionData,
-                encoderSurface = session.inputSurface,
-                captureMode = mode,
-                width = preset.width,
-                height = preset.height,
-                dpi = cfg.virtualDpi,
-                onLog = { msg -> appendLog("DISPLAY-MGR", msg, isPrivileged = cfg.rootDirectSurfaceControl) }
-            ) ?: if (mode == DisplayCaptureMode.VIRTUAL_EXTENDED) 2 else 0
+            val displayId = withContext(Dispatchers.Main) {
+                boundService?.bindDisplayCaptureSurface(
+                    resultCode = mediaProjectionResultCode,
+                    projectionData = mediaProjectionData,
+                    encoderSurface = session.inputSurface,
+                    captureMode = mode,
+                    width = preset.width,
+                    height = preset.height,
+                    dpi = cfg.virtualDpi,
+                    onLog = { msg -> appendLog("DISPLAY-MGR", msg, isPrivileged = cfg.rootDirectSurfaceControl) }
+                )
+            } ?: if (mode == DisplayCaptureMode.VIRTUAL_EXTENDED) 2 else 0
 
             val captureBackendLabel = when {
                 cfg.rootModeEnabled && cfg.rootDirectSurfaceControl ->
@@ -311,22 +327,15 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun stopHostStream() {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             if (_telemetry.value.isPhoneOledBlanked) {
                 rootManager.setPhysicalScreenBlanked(false) { msg ->
                     appendLog("OLED-POWER", msg, isPrivileged = true)
                 }
             }
             encoderEngine.stopEncoder()
-            boundService?.releaseVirtualDisplay()
-
-            val app = getApplication<Application>()
-            runCatching {
-                if (isServiceBound) {
-                    app.unbindService(serviceConnection)
-                    isServiceBound = false
-                }
-                app.stopService(Intent(app, SunshineHostService::class.java))
+            withContext(Dispatchers.Main) {
+                boundService?.releaseVirtualDisplay()
             }
 
             _telemetry.update {
@@ -347,7 +356,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun togglePhoneOledBlanking(blank: Boolean) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             rootManager.setPhysicalScreenBlanked(blank) { msg ->
                 appendLog("OLED-SAVER", msg, isPrivileged = true)
             }
@@ -356,7 +365,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun updateDisplayCaptureMode(mode: DisplayCaptureMode) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.updateConfig { it.copy(captureModeName = mode.name) }
             appendLog("DISPLAY-CFG", "Switched capture topology to ${mode.title} (${mode.sunshineAppTitle})", false)
             if (_telemetry.value.status == HostStreamStatus.STREAMING_ACTIVE) {
@@ -366,7 +375,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun updateResolutionPreset(preset: TabletResolutionPreset) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.updateConfig {
                 it.copy(
                     resolutionPresetName = preset.name,
@@ -381,7 +390,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun updateRefreshRate(hz: Int) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.updateConfig { it.copy(refreshRateHz = hz) }
             appendLog("DISPLAY-CFG", "Set target frame pacing to $hz Hz", false)
             if (_telemetry.value.status == HostStreamStatus.STREAMING_ACTIVE) {
@@ -391,13 +400,13 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun updateVirtualDpi(dpi: Int) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.updateConfig { it.copy(virtualDpi = dpi.coerceIn(160, 420)) }
         }
     }
 
     fun updateCodecProfile(profile: VideoCodecProfile) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.updateConfig { it.copy(codecProfileName = profile.name) }
             appendLog("CODEC-CFG", "Prioritized ${profile.title} (${profile.mimeType}) hardware pipeline", false)
             if (_telemetry.value.status == HostStreamStatus.STREAMING_ACTIVE) {
@@ -407,19 +416,19 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun updateBitrateMbps(mbps: Int) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.updateConfig { it.copy(targetBitrateMbps = mbps.coerceIn(10, 150)) }
         }
     }
 
     fun updateFecPercentage(fec: Int) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.updateConfig { it.copy(fecPercentage = fec.coerceIn(0, 40)) }
         }
     }
 
     fun updateLowLatencyCbr(enabled: Boolean) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.updateConfig { it.copy(lowLatencyCbrMode = enabled) }
         }
     }
@@ -431,7 +440,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
         autoBlankOled: Boolean? = null,
         lockGovernor: Boolean? = null
     ) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.updateConfig { current ->
                 current.copy(
                     rootModeEnabled = rootEnabled ?: current.rootModeEnabled,
@@ -484,39 +493,43 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun saveVerifiedPairedClient(clientName: String, clientIp: String, pinCode: String) {
-        viewModelScope.launch {
-            val now = System.currentTimeMillis()
-            val fingerprint = "SHA256:${pinCode.chunked(2).joinToString(":")}:A4:7F:E2:19:9C:B1:08:D4"
-            val currentMode = hostConfig.value.captureModeName
-            repository.addPairedClient(
-                PairedClientEntity(
-                    clientName = clientName,
-                    clientIpAddress = clientIp,
-                    tabletModelSpec = "10\" Tablet • PIN #$pinCode Verified • HTTPS :47984 mTLS",
-                    certFingerprint = fingerprint,
-                    pairedTimestampMs = now,
-                    lastConnectedMs = now,
-                    preferredDisplayMode = currentMode,
-                    isTrusted = true
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val now = System.currentTimeMillis()
+                val fingerprint = "SHA256:${pinCode.chunked(2).joinToString(":")}:A4:7F:E2:19:9C:B1:08:D4"
+                val currentMode = hostConfig.value.captureModeName
+                val existing = pairedClients.value.firstOrNull { it.clientIpAddress == clientIp }
+                repository.addPairedClient(
+                    PairedClientEntity(
+                        id = existing?.id ?: 0,
+                        clientName = clientName,
+                        clientIpAddress = clientIp,
+                        tabletModelSpec = "10\" Tablet • PIN #$pinCode Verified • HTTPS :47984 mTLS",
+                        certFingerprint = fingerprint,
+                        pairedTimestampMs = existing?.pairedTimestampMs ?: now,
+                        lastConnectedMs = now,
+                        preferredDisplayMode = currentMode,
+                        isTrusted = true
+                    )
                 )
-            )
-            appendLog(
-                subsystem = "PAIR-VAULT",
-                message = "Paired '$clientName' ($clientIp) with PIN $pinCode & X.509 RSA-2048 cert",
-                isPrivileged = false
-            )
+                appendLog(
+                    subsystem = "PAIR-VAULT",
+                    message = "Paired '$clientName' ($clientIp) with PIN $pinCode & X.509 RSA-2048 cert",
+                    isPrivileged = false
+                )
+            }
         }
     }
 
     fun removePairedClient(clientId: Int) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.removePairedClient(clientId)
             appendLog("PAIR-VAULT", "Revoked client certificate id=$clientId", false)
         }
     }
 
     fun connectToPairedClient(client: PairedClientEntity) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.markClientConnected(client.id)
             encoderEngine.updateTargetClientIp(client.clientIpAddress)
             appendLog("MOONLIGHT-LINK", "Initiated low-latency RTP stream to ${client.clientName} (${client.clientIpAddress})", false)
@@ -525,7 +538,7 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun testReturnTouchOrStylusEvent(isStylus: Boolean) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             val cfg = hostConfig.value
             val preset = runCatching { TabletResolutionPreset.valueOf(cfg.resolutionPresetName) }
                 .getOrDefault(TabletResolutionPreset.WUXGA_1920_1200)
@@ -565,6 +578,13 @@ class SolisHostViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     override fun onCleared() {
+        val app = getApplication<Application>()
+        runCatching {
+            if (isServiceBound) {
+                app.unbindService(serviceConnection)
+                isServiceBound = false
+            }
+        }
         encoderEngine.stopEncoder()
         discoveryServer.stopSunshineDaemon()
         super.onCleared()

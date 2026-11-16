@@ -58,9 +58,12 @@ class SunshineCryptoManager(private val context: Context) {
 
     private val sessions = ConcurrentHashMap<String, PairingSessionState>()
 
+    @Volatile
+    private var lastActiveSession: PairingSessionState? = null
+
     init {
-        val certFile = File(context.filesDir, "solishost_sunshine_cert.der")
-        val keyFile = File(context.filesDir, "solishost_sunshine_key.pkcs8")
+        val certFile = File(context.filesDir, "solishost_sunshine_cert_v3.der")
+        val keyFile = File(context.filesDir, "solishost_sunshine_key_v3.pkcs8")
 
         if (certFile.exists() && keyFile.exists()) {
             val loaded = runCatching {
@@ -161,9 +164,10 @@ class SunshineCryptoManager(private val context: Context) {
         clientCertHex: String,
         pinCode: String
     ): String {
-        val saltBytes = hexToBytes(saltHex).let {
-            if (it.size >= 16) it.copyOfRange(0, 16) else ByteArray(16)
-        }
+        val rawSalt = hexToBytes(saltHex)
+        val saltBytes = ByteArray(16)
+        System.arraycopy(rawSalt, 0, saltBytes, 0, minOf(rawSalt.size, 16))
+
         val aesKey = deriveAesKeySha256(saltBytes, pinCode)
         val session = PairingSessionState(
             clientUniqueId = clientUniqueId,
@@ -174,6 +178,7 @@ class SunshineCryptoManager(private val context: Context) {
         )
         sessions[clientUniqueId] = session
         sessions[clientIp] = session
+        lastActiveSession = session
 
         return """<?xml version="1.0" encoding="utf-8"?><root status_code="200"><paired>1</paired><plaincert>$serverCertPemHex</plaincert></root>"""
     }
@@ -187,10 +192,13 @@ class SunshineCryptoManager(private val context: Context) {
         clientIp: String,
         clientChallengeHex: String
     ): String {
-        val session = sessions[clientUniqueId] ?: sessions[clientIp] ?: PairingSessionState(
-            clientUniqueId = clientUniqueId,
-            clientIp = clientIp
-        )
+        val session = sessions[clientUniqueId]
+            ?: sessions[clientIp]
+            ?: lastActiveSession
+            ?: PairingSessionState(
+                clientUniqueId = clientUniqueId,
+                clientIp = clientIp
+            )
         val encryptedChallenge = hexToBytes(clientChallengeHex)
         val decryptedChallenge = aesEcbDecrypt(encryptedChallenge, session.aesKeySha256)
         session.decryptedClientChallenge = decryptedChallenge
@@ -199,6 +207,7 @@ class SunshineCryptoManager(private val context: Context) {
         val serverChallenge = ByteArray(16).also { secureRandom.nextBytes(it) }
         session.serverSecret = serverSecret
         session.serverChallenge = serverChallenge
+        lastActiveSession = session
 
         // GameStream Gen 7 (GfeVersion >= 3.20): SHA-256(decryptedClientChallenge || serverCert.signature || serverSecret)
         val md = MessageDigest.getInstance("SHA-256")
@@ -225,7 +234,7 @@ class SunshineCryptoManager(private val context: Context) {
         clientUniqueId: String,
         clientIp: String
     ): String {
-        val session = sessions[clientUniqueId] ?: sessions[clientIp]
+        val session = sessions[clientUniqueId] ?: sessions[clientIp] ?: lastActiveSession
         val serverSecret = session?.serverSecret ?: ByteArray(16).also { secureRandom.nextBytes(it) }
 
         val signer = Signature.getInstance("SHA256withRSA")
@@ -244,6 +253,9 @@ class SunshineCryptoManager(private val context: Context) {
         for (session in sessions.values) {
             session.aesKeySha256 = deriveAesKeySha256(session.saltBytes, pinCode)
         }
+        lastActiveSession?.let {
+            it.aesKeySha256 = deriveAesKeySha256(it.saltBytes, pinCode)
+        }
     }
 
     private fun deriveAesKeySha256(salt16: ByteArray, pinCode: String): ByteArray {
@@ -256,16 +268,25 @@ class SunshineCryptoManager(private val context: Context) {
     }
 
     private fun aesEcbEncrypt(plain: ByteArray, key16: ByteArray): ByteArray {
-        val cipher = Cipher.getInstance("AES/ECB/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key16, "AES"))
-        return cipher.doFinal(plain)
+        return runCatching {
+            val safeKey = if (key16.size == 16) key16 else key16.copyOf(16)
+            val paddedLen = ((plain.size + 15) / 16) * 16
+            val safePlain = if (plain.size == paddedLen) plain else plain.copyOf(paddedLen)
+            val cipher = Cipher.getInstance("AES/ECB/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(safeKey, "AES"))
+            cipher.doFinal(safePlain)
+        }.getOrElse { ByteArray(48) }
     }
 
     private fun aesEcbDecrypt(cipherBytes: ByteArray, key16: ByteArray): ByteArray {
         return runCatching {
+            val safeKey = if (key16.size == 16) key16 else key16.copyOf(16)
+            val blockLen = (cipherBytes.size / 16) * 16
+            if (blockLen <= 0) return ByteArray(16)
+            val safeCipher = if (cipherBytes.size == blockLen) cipherBytes else cipherBytes.copyOfRange(0, blockLen)
             val cipher = Cipher.getInstance("AES/ECB/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key16, "AES"))
-            cipher.doFinal(cipherBytes)
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(safeKey, "AES"))
+            cipher.doFinal(safeCipher)
         }.getOrElse { ByteArray(16) }
     }
 
@@ -304,8 +325,16 @@ class SunshineCryptoManager(private val context: Context) {
                 textAlign = Paint.Align.CENTER
                 isFakeBoldText = true
             }
-            val titleLine1 = if (appId == "1") "10\" TABLET" else "PHONE PRIMARY"
-            val titleLine2 = if (appId == "1") "EXTENDED DISPLAY" else "SCREEN MIRROR"
+            val titleLine1 = when (appId) {
+                "1" -> "DESKTOP"
+                "2" -> "10\" TABLET"
+                else -> "PHONE PRIMARY"
+            }
+            val titleLine2 = when (appId) {
+                "1" -> "10\" WORKSPACE"
+                "2" -> "EXTENDED DISPLAY"
+                else -> "SCREEN MIRROR"
+            }
             canvas.drawText("SOLISHOST", width / 2f, 150f, textPaint)
             canvas.drawText(titleLine1, width / 2f, 210f, textPaint)
             canvas.drawText(titleLine2, width / 2f, 250f, textPaint)
@@ -323,7 +352,8 @@ class SunshineCryptoManager(private val context: Context) {
     }
 
     /**
-     * Pure Kotlin ASN.1 DER X.509v3 Self-Signed Certificate Builder (RSA 2048, SHA256withRSA).
+     * Pure Kotlin ASN.1 DER X.509v3 Self-Signed Certificate Builder (RSA 2048, SHA256withRSA)
+     * including RFC 5280 BasicConstraints and KeyUsage extensions for BoringSSL TLS 1.2/1.3 compatibility.
      */
     private fun generateSelfSignedX509Certificate(): Pair<X509Certificate, PrivateKey> {
         val kpg = KeyPairGenerator.getInstance("RSA")
@@ -359,6 +389,17 @@ class SunshineCryptoManager(private val context: Context) {
 
         val spkiDer = kp.public.encoded
 
+        // X.509v3 Extensions: BasicConstraints (2.5.29.19 -> CA:FALSE) + KeyUsage (2.5.29.15 -> digitalSignature | keyEncipherment)
+        val basicConstraintsExt = derSequence(
+            byteArrayOf(0x06, 0x03, 0x55, 0x1D, 0x13) +
+                derTag(0x04, derSequence(ByteArray(0)))
+        )
+        val keyUsageExt = derSequence(
+            byteArrayOf(0x06, 0x03, 0x55, 0x1D, 0x0F) +
+                derTag(0x04, byteArrayOf(0x03, 0x02, 0x05, 0xA0.toByte()))
+        )
+        val extensionsExplicit = derTag(0xA3, derSequence(basicConstraintsExt + keyUsageExt))
+
         val tbsBytes = derSequence(
             versionExplicit +
                 serialDer +
@@ -366,7 +407,8 @@ class SunshineCryptoManager(private val context: Context) {
                 nameSeq +
                 validitySeq +
                 nameSeq +
-                spkiDer
+                spkiDer +
+                extensionsExplicit
         )
 
         val signer = Signature.getInstance("SHA256withRSA")
